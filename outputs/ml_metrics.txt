@@ -1,0 +1,24 @@
+=== ML RESULTS (Pathogenic vs Benign) ===
+Train size: 17350 | Val size: 3718 | Test size: 3719
+
+Validation Accuracy: 0.7717
+Validation ROC-AUC : 0.7592
+Validation Log Loss (Cross-Entropy): 0.5167
+
+Test Accuracy: 0.7642
+Test ROC-AUC : 0.7480
+Test Log Loss (Cross-Entropy): 0.5264
+
+Confusion Matrix (Test):
+[[2357  122]
+ [ 755  485]]
+
+Classification Report (Test):
+              precision    recall  f1-score   support
+
+           0       0.76      0.95      0.84      2479
+           1       0.80      0.39      0.53      1240
+
+    accuracy                           0.76      3719
+   macro avg       0.78      0.67      0.68      3719
+weighted avg       0.77      0.76      0.74      3719

@@ -1,0 +1,7 @@
+metric,value
+total_variants_with_seq,42972
+mutation_type_counts,"{'SNP': 38162, 'DEL': 3196, 'INS': 1486, 'OTHER': 128}"
+transition_transversion_counts (SNP only),"{'transition': 25285, 'transversion': 12877}"
+gc_mean,0.5335360219408865
+gc_min,0.16611295681063123
+gc_max,0.8660130718954249
