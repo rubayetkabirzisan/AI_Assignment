@@ -1,13 +1,22 @@
 # FASTA.py
 # AI CT-2 Replacement Assignment
 # BioPython + Sequence Analysis + Pattern Analysis + ML (Train/Test/Validation + Loss)
+#
+# ✅ Updates added (as you requested):
+# 1) Read FASTA file (already)
+# 2) Mutation analysis:
+#    - "WHERE" mutation occurs inside flanking sequence (left/center/right)
+#    - Mutation pattern (SNP/INS/DEL + transition/transversion)
+#    - Mutation & targeted disease correlation (CSV outputs)
+# 3) Simple grammar rules (1–2 rules; optional 3rd tuned threshold)
+# 4) Train/Test those rules (accuracy ~50% ok)
+# 5) Validation with loss function (log loss)
 
 import os
 import re
 import csv
 from dataclasses import dataclass
 from typing import Dict, Tuple, List, Optional
-from collections import Counter
 from itertools import product
 
 import numpy as np
@@ -28,6 +37,98 @@ from sklearn.metrics import (
 
 BASES = "ACGT"
 TRANSITIONS = {("A", "G"), ("G", "A"), ("C", "T"), ("T", "C")}
+
+
+# -----------------------------
+# NEW: helpers for "WHERE"
+# -----------------------------
+def get_variant_pos(row: pd.Series) -> Optional[int]:
+    """
+    Tries to find the genomic position column in the TSV.
+    Common columns: start, pos, position (case-insensitive).
+    Returns an int position (typically 1-based in VCF-like files).
+    """
+    # Try exact common names first
+    for col in ["start", "pos", "position"]:
+        if col in row and pd.notna(row[col]):
+            try:
+                return int(row[col])
+            except Exception:
+                pass
+
+    # Try case-insensitive match
+    lower_map = {c.lower(): c for c in row.index}
+    for key in ["start", "pos", "position"]:
+        if key in lower_map:
+            col = lower_map[key]
+            if pd.notna(row[col]):
+                try:
+                    return int(row[col])
+                except Exception:
+                    pass
+    return None
+
+
+def mutation_where_category(rel_index: Optional[int], seq_len: int) -> Optional[str]:
+    """
+    Categorize where mutation lies in the flanking sequence.
+    rel_index is 0-based within the flanking sequence.
+    """
+    if rel_index is None or seq_len <= 0:
+        return None
+    # If rel_index is outside, mark unknown (prevents misleading "where")
+    if rel_index < 0 or rel_index >= seq_len:
+        return "unknown"
+
+    frac = rel_index / seq_len
+    if frac < 1 / 3:
+        return "left"
+    elif frac < 2 / 3:
+        return "center"
+    else:
+        return "right"
+
+
+# -----------------------------
+# NEW: Rule-based "grammar"
+# -----------------------------
+def grammar_predict(ref: str, alt: str, tt: Optional[str], gc: float, gc_thresh: Optional[float] = None) -> int:
+    """
+    Rule-based classifier ("grammar").
+    Returns 1 (Pathogenic) or 0 (Benign).
+
+    Base Grammar (2 rules):
+    1) If INS or DEL => Pathogenic
+    2) Else if SNP and transversion => Pathogenic
+       Else => Benign
+
+    Optional tuned add-on rule (only if gc_thresh is not None):
+    3) If GC >= gc_thresh => Pathogenic
+    """
+    ref = str(ref).upper()
+    alt = str(alt).upper()
+
+    # Rule 1: Indels tend to be more disruptive
+    if len(ref) != len(alt):
+        return 1
+
+    # Rule 2: transversion SNP
+    if tt == "transversion":
+        return 1
+
+    # Optional: GC threshold rule (tiny "training" via threshold search)
+    if gc_thresh is not None and gc >= gc_thresh:
+        return 1
+
+    return 0
+
+
+def prob_from_rule(pred: int) -> float:
+    """
+    Convert a hard rule decision into a probability for log-loss.
+    Avoids 0/1 probabilities which can explode log_loss.
+    """
+    return 0.7 if pred == 1 else 0.3
 
 
 @dataclass
@@ -109,7 +210,7 @@ def kmer_3mer_features(seq: str, kmer_index: Dict[str, int]) -> np.ndarray:
     vec = np.zeros(len(kmer_index), dtype=np.float32)
     denom = max(L - 2, 1)
     for i in range(L - 2):
-        k = seq[i:i+3]
+        k = seq[i:i + 3]
         if set(k) <= set(BASES):
             vec[kmer_index[k]] += 1.0
     vec /= denom
@@ -185,6 +286,31 @@ def main():
     print(f"Variants total: {len(df)}")
     print(f"Variants with sequence found: {len(df_joined)}")
 
+    # ============================================================
+    # NEW: MUTATION "WHERE" INSIDE FLANKING SEQUENCE
+    # ============================================================
+    # We infer genomic variant position from TSV (start/pos/position)
+    # region start is from FASTA header key (chrom, start1, end)
+    # rel_index = variant_pos - region_start1 (0-based within sequence)
+    print("Computing mutation 'where' (left/center/right) within flanking sequence...")
+
+    df_joined["variant_pos"] = df_joined.apply(get_variant_pos, axis=1)
+
+    def compute_rel_index(row: pd.Series) -> Optional[int]:
+        vid = int(row["variant_id"])
+        region = vid_to_region.get(vid)
+        if region is None:
+            return None
+        chrom, region_start1, region_end = region
+        pos = row["variant_pos"]
+        if pos is None or pd.isna(pos):
+            return None
+        # assumes pos is 1-based; if your TSV is 0-based, change to: int(pos + 1) - region_start1
+        return int(pos) - int(region_start1)
+
+    df_joined["rel_index"] = df_joined.apply(compute_rel_index, axis=1)
+    df_joined["where"] = df_joined.apply(lambda r: mutation_where_category(r["rel_index"], len(r["sequence"])), axis=1)
+
     # ====== SEQUENCE + MUTATION SUMMARY ======
     # Mutation type counts
     def mut_type(ref: str, alt: str) -> str:
@@ -213,10 +339,16 @@ def main():
 
     df_joined["gc"] = df_joined["sequence"].apply(gc_content)
 
+    # ----------------------------------------
+    # NEW: mutation "where" distribution summary
+    # ----------------------------------------
+    where_counts = df_joined["where"].value_counts(dropna=False).to_dict()
+
     mutation_summary = {
         "total_variants_with_seq": int(len(df_joined)),
         "mutation_type_counts": df_joined["mut_type"].value_counts().to_dict(),
         "transition_transversion_counts (SNP only)": df_joined["tt"].value_counts(dropna=True).to_dict(),
+        "mutation_where_counts (left/center/right/unknown)": where_counts,
         "gc_mean": float(df_joined["gc"].mean()),
         "gc_min": float(df_joined["gc"].min()),
         "gc_max": float(df_joined["gc"].max()),
@@ -232,15 +364,61 @@ def main():
 
     # Save basic sequence summary (first 200 rows preview for readability)
     seq_summary_path = os.path.join(OUT_DIR, "sequence_summary.csv")
-    df_joined[[
+    preview_cols = [
         "variant_id", "chromosome", "start", "end", "ref", "alt",
         "clinical_significance", "molecular_consequence", "genes",
-        "mut_type", "tt", "gc"
-    ]].head(200).to_csv(seq_summary_path, index=False)
+        "mut_type", "tt", "gc", "variant_pos", "rel_index", "where"
+    ]
+    # Keep only columns that exist in TSV (prevents crash if column name differs)
+    preview_cols = [c for c in preview_cols if c in df_joined.columns]
+    df_joined[preview_cols].head(200).to_csv(seq_summary_path, index=False)
 
     print("Saved:")
     print(" -", mutation_summary_path)
     print(" -", seq_summary_path)
+
+    # ============================================================
+    # NEW: MUTATION & DISEASE CORRELATION TABLES
+    # ============================================================
+    if "disease_names" in df_joined.columns:
+        print("Generating disease correlation tables...")
+
+        disease_mut = (
+            df_joined.dropna(subset=["disease_names"])
+            .groupby(["disease_names", "mut_type"])
+            .size()
+            .reset_index(name="count")
+            .sort_values(["disease_names", "count"], ascending=[True, False])
+        )
+        disease_mut_path = os.path.join(OUT_DIR, "disease_mutation_type_counts.csv")
+        disease_mut.to_csv(disease_mut_path, index=False)
+
+        disease_tt = (
+            df_joined.dropna(subset=["disease_names", "tt"])
+            .groupby(["disease_names", "tt"])
+            .size()
+            .reset_index(name="count")
+            .sort_values(["disease_names", "count"], ascending=[True, False])
+        )
+        disease_tt_path = os.path.join(OUT_DIR, "disease_transition_transversion_counts.csv")
+        disease_tt.to_csv(disease_tt_path, index=False)
+
+        disease_where = (
+            df_joined.dropna(subset=["disease_names", "where"])
+            .groupby(["disease_names", "where"])
+            .size()
+            .reset_index(name="count")
+            .sort_values(["disease_names", "count"], ascending=[True, False])
+        )
+        disease_where_path = os.path.join(OUT_DIR, "disease_where_counts.csv")
+        disease_where.to_csv(disease_where_path, index=False)
+
+        print("Saved:")
+        print(" -", disease_mut_path)
+        print(" -", disease_tt_path)
+        print(" -", disease_where_path)
+    else:
+        print("NOTE: 'disease_names' column not found in TSV, so disease correlation tables were skipped.")
 
     # ====== ML DATASET ======
     df_joined["y"] = df_joined["clinical_significance"].apply(label_pathogenicity)
@@ -249,6 +427,95 @@ def main():
 
     print("\nML dataset size (after filtering uncertain/conflicting):", len(df_ml))
     print("Label counts:", df_ml["y"].value_counts().to_dict())
+
+    # ============================================================
+    # NEW: RULE-BASED GRAMMAR (Train/Val/Test + Loss)
+    # ============================================================
+    print("\nRunning rule-based grammar (1–2 rules) with train/val/test + loss...")
+
+    df_ml = df_ml.reset_index(drop=True)
+
+    train_idx, temp_idx = train_test_split(
+        df_ml.index, test_size=0.30, random_state=42, stratify=df_ml["y"]
+    )
+    val_idx, test_idx = train_test_split(
+        temp_idx, test_size=0.50, random_state=42, stratify=df_ml.loc[temp_idx, "y"]
+    )
+
+    df_train = df_ml.loc[train_idx].copy()
+    df_val = df_ml.loc[val_idx].copy()
+    df_test = df_ml.loc[test_idx].copy()
+
+    # Choose whether to tune ONE threshold (GC threshold) for tiny "training"
+    use_gc_tuning = True  # set False if teacher insists ONLY 2 rules, no tuning
+
+    gc_thresh_best = None
+    best_val_acc = -1.0
+    best_val_loss = 1e9
+
+    if use_gc_tuning:
+        candidate_thresholds = [0.35, 0.40, 0.45, 0.50, 0.55, 0.60]
+        for thr in candidate_thresholds:
+            preds = []
+            probs = []
+            y_true = df_val["y"].values
+
+            for ref, alt, tt, gc in zip(df_val["ref"], df_val["alt"], df_val["tt"], df_val["gc"]):
+                pred = grammar_predict(ref, alt, tt, gc, gc_thresh=thr)
+                preds.append(pred)
+                probs.append(prob_from_rule(pred))
+
+            acc = accuracy_score(y_true, preds)
+            loss = log_loss(y_true, probs)
+
+            if (acc > best_val_acc) or (acc == best_val_acc and loss < best_val_loss):
+                best_val_acc = acc
+                best_val_loss = loss
+                gc_thresh_best = thr
+
+    def eval_grammar(df_split: pd.DataFrame, gc_thr: Optional[float]):
+        y_true = df_split["y"].values
+        preds = []
+        probs = []
+        for ref, alt, tt, gc in zip(df_split["ref"], df_split["alt"], df_split["tt"], df_split["gc"]):
+            pred = grammar_predict(ref, alt, tt, gc, gc_thresh=gc_thr)
+            preds.append(pred)
+            probs.append(prob_from_rule(pred))
+        acc = accuracy_score(y_true, preds)
+        loss = log_loss(y_true, probs)
+        cm_rule = confusion_matrix(y_true, preds)
+        return acc, loss, cm_rule
+
+    train_acc_r, train_loss_r, train_cm_r = eval_grammar(df_train, gc_thresh_best if use_gc_tuning else None)
+    val_acc_r, val_loss_r, val_cm_r = eval_grammar(df_val, gc_thresh_best if use_gc_tuning else None)
+    test_acc_r, test_loss_r, test_cm_r = eval_grammar(df_test, gc_thresh_best if use_gc_tuning else None)
+
+    rule_report_lines = []
+    rule_report_lines.append("=== RULE-BASED GRAMMAR RESULTS ===")
+    rule_report_lines.append("Grammar rules:")
+    rule_report_lines.append("  Rule 1: If INS or DEL => Pathogenic")
+    rule_report_lines.append("  Rule 2: Else if SNP is transversion => Pathogenic")
+    if use_gc_tuning:
+        rule_report_lines.append(f"  Tuned extra rule: If GC >= {gc_thresh_best} => Pathogenic")
+    else:
+        rule_report_lines.append("  (No extra tuned rule; strict 2-rule grammar only)")
+    rule_report_lines.append("")
+    rule_report_lines.append(f"Train Accuracy: {train_acc_r:.4f} | Train Log Loss: {train_loss_r:.4f}")
+    rule_report_lines.append(f"Val   Accuracy: {val_acc_r:.4f} | Val   Log Loss: {val_loss_r:.4f}")
+    rule_report_lines.append(f"Test  Accuracy: {test_acc_r:.4f} | Test  Log Loss: {test_loss_r:.4f}")
+    rule_report_lines.append("")
+    rule_report_lines.append("Confusion Matrix (Test):")
+    rule_report_lines.append(str(test_cm_r))
+
+    rule_metrics_path = os.path.join(OUT_DIR, "rule_metrics.txt")
+    with open(rule_metrics_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(rule_report_lines))
+
+    print("Saved:", rule_metrics_path)
+
+    # ============================================================
+    # ORIGINAL ML: Logistic Regression (Train/Val/Test + Loss)
+    # ============================================================
 
     # Build k-mer index
     kmers = ["".join(p) for p in product(BASES, repeat=3)]
@@ -324,7 +591,6 @@ def main():
     print("\nSaved:", ml_metrics_path)
 
     # Save test predictions (for submission evidence)
-    # We'll output probability + predicted class
     test_pred_path = os.path.join(OUT_DIR, "test_predictions.csv")
     pd.DataFrame({
         "y_true": y_test,
@@ -335,6 +601,13 @@ def main():
     print("Saved:", test_pred_path)
 
     print("\nDONE ✅ Run complete. Check the outputs/ folder.")
+    print("\nOutputs now include (at least):")
+    print(" - mutation_summary.csv")
+    print(" - sequence_summary.csv")
+    print(" - rule_metrics.txt  ✅ (your grammar rules + train/val/test + loss)")
+    print(" - ml_metrics.txt")
+    print(" - test_predictions.csv")
+    print("Plus disease correlation CSVs if disease_names exists.")
 
 
 if __name__ == "__main__":

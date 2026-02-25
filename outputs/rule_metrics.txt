@@ -1,0 +1,13 @@
+=== RULE-BASED GRAMMAR RESULTS ===
+Grammar rules:
+  Rule 1: If INS or DEL => Pathogenic
+  Rule 2: Else if SNP is transversion => Pathogenic
+  Tuned extra rule: If GC >= 0.6 => Pathogenic
+
+Train Accuracy: 0.5318 | Train Log Loss: 0.7534
+Val   Accuracy: 0.5320 | Val   Log Loss: 0.7532
+Test  Accuracy: 0.5324 | Test  Log Loss: 0.7529
+
+Confusion Matrix (Test):
+[[1045 1434]
+ [ 305  935]]
